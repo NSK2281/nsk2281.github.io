@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="robots" content="noindex">
+<meta name="referrer" content="no-referrer">
+<title>DLM:wait</title>
+<p>Dota Links: служебная страница мода для Dota 2. Её открывает сама игра, здесь ничего нет.</p>
+<script>
+// Dota Links bridge page (v1).
+// The game's embedded browser opens only https:// pages and Panorama scripts cannot reach the
+// network, so the mod loads this page with the request in the query string:
+//   ?mode=ping                      -> {"ping":1,"v":1}
+//   ?mode=profile&id=<account>      -> rank + winrate all time / 30 days / 7 days
+//   ?mode=week&ids=<a>,<b>,...      -> 7-day win/loss of up to 10 players
+// It asks the public OpenDota API and reports back through document.title ("DLM:" + JSON) after
+// every answer; the mod reads that from the HTMLTitle event. No cookies, no other scripts.
+// Values: [wins, losses]; null = OpenDota has no such data; -1 = no answer; -2 = OpenDota's
+// request limit (60 a minute) is used up, so try again in a minute.
+(function () {
+  'use strict';
+  var VERSION = 1;
+  var API = 'https://api.opendota.com/api/players/';
+  var START = Date.now();
+  var DEADLINE = 24000;   // the full answer is always sent within this time
+  var TRY = 12000;        // OpenDota sometimes needs 10+ s for one request
+  var LIMITED = {};
+  var q = {};
+  location.search.slice(1).split('&').forEach(function (kv) {
+    var i = kv.indexOf('=');
+    if (i > 0) {
+      try { q[decodeURIComponent(kv.slice(0, i))] = decodeURIComponent(kv.slice(i + 1)); } catch (e) {}
+    }
+  });
+  var out = {}, left = 0, finishers = [];
+  var send = function () { document.title = 'DLM:' + JSON.stringify(out); };
+
+  // done(value) is called exactly once: the JSON, null for a non-OK answer, -1 or -2.
+  // A stalled or failed try is repeated once if there is time left; a 429 is not retried, since
+  // the per-minute limit will not be over a second later.
+  var get = function (url, done) {
+    var finished = false;
+    var finish = function (v) { if (!finished) { finished = true; done(v); } };
+    finishers.push(finish);
+    var attempt = function (n) {
+      var remaining = DEADLINE - (Date.now() - START);
+      if (remaining < 1500) { finish(-1); return; }
+      var c = typeof AbortController === 'function' ? new AbortController() : null;
+      var failed = function () {
+        if (finished) return;
+        if (n < 1) setTimeout(function () { attempt(n + 1); }, 1000);
+        else finish(-1);
+      };
+      var t = setTimeout(function () { if (c) c.abort(); else failed(); }, Math.min(TRY, remaining - 500));
+      var opts = { credentials: 'omit' };
+      if (c) opts.signal = c.signal;
+      fetch(url, opts)
+        .then(function (r) {
+          if (r.status === 429) return LIMITED;
+          if (r.status >= 500) throw r.status;
+          return r.ok ? r.json() : null;
+        })
+        .then(function (j) { clearTimeout(t); finish(j === LIMITED ? -2 : j); },
+              function () { clearTimeout(t); failed(); });
+    };
+    attempt(0);
+  };
+  var wl = function (j) { return typeof j === 'number' ? j : (j ? [j.win || 0, j.lose || 0] : null); };
+  // belt and braces: whatever is still open at the deadline is reported as "no answer"
+  setTimeout(function () { finishers.forEach(function (f) { f(-1); }); }, DEADLINE);
+
+  if (q.mode === 'ping') {
+    out = { ping: 1, v: VERSION };
+    send();
+  } else if (q.mode === 'profile' && /^\d{1,12}$/.test(q.id || '')) {
+    var api = API + q.id;
+    out.id = q.id;
+    left = 4;
+    var finish = function () { if (--left === 0) out.done = 1; send(); };
+    // rank -1 / -2: the profile request failed, which is not the same as having no rank
+    get(api, function (p) {
+      out.rank = typeof p === 'number' ? p : (p && p.rank_tier) || 0;
+      out.lb = (p && typeof p === 'object' && p.leaderboard_rank) || 0;
+      out.ranked = 1;
+      finish();
+    });
+    get(api + '/wl', function (j) { out.all = wl(j); finish(); });
+    get(api + '/wl?date=30', function (j) { out.month = wl(j); finish(); });
+    get(api + '/wl?date=7', function (j) { out.week = wl(j); finish(); });
+  } else if (q.mode === 'week' && /^\d{1,12}(,\d{1,12}){0,9}$/.test(q.ids || '')) {
+    var ids = q.ids.split(',');
+    left = ids.length;
+    ids.forEach(function (id, i) {
+      setTimeout(function () {
+        get(API + id + '/wl?date=7', function (j) {
+          out[id] = wl(j);
+          if (--left === 0) out.__done = 1;
+          send();
+        });
+      }, i * 60);
+    });
+  } else {
+    out = { error: 'bad request' };
+    send();
+  }
+})();
+</script>
+</html>
